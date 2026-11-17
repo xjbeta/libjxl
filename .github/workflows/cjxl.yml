@@ -1,0 +1,166 @@
+name: cjxl
+
+# Builds the encoder from this fork. JXLQuickLook downloads the cjxl-arm64
+# artifact; nothing on a developer machine builds libjxl or takes it from
+# Homebrew. The fork carries the JXLQL_PROGRESS markers used by the Finder
+# progress indicator; the same recipe and verification still apply.
+
+on:
+  workflow_dispatch:
+    inputs:
+      publish_release:
+        description: Publish cjxl to a GitHub release
+        required: false
+        type: boolean
+        default: false
+      release_tag:
+        description: Release tag to attach cjxl to (required when publishing)
+        required: false
+        type: string
+        default: ""
+
+concurrency:
+  group: cjxl-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  LIBPNG_VERSION: v1.6.59
+  JPEGTURBO_VERSION: 3.2.1
+  # Everything that ships supports macOS 15.0 and later, the encoder included.
+  DEPLOYMENT_TARGET: "15.0"
+
+jobs:
+  build:
+    # xcode-27 is the arm64 image (macOS 27.0.1), the toolchain the app is
+    # built with. The deployment target is asserted below, so a newer SDK
+    # cannot leak into the artifact.
+    runs-on: xcode-27
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          # libjxl needs Highway and Brotli from its submodules when the
+          # bundle is built on a clean runner.
+          submodules: recursive
+          fetch-depth: 0
+
+      # GIF input is disabled on purpose: the app converts jpg/png/bmp/tiff
+      # only, and dropping giflib removes a dependency from the link line.
+      - name: Build static dependencies
+        run: |
+          set -eu
+          WORK="$RUNNER_TEMP/jxl-build"
+          mkdir -p "$WORK"
+
+          cmake_dep() {
+            src="$1"
+            shift
+            cmake -B "$src/build" -S "$src" -G Ninja \
+              -DCMAKE_BUILD_TYPE=Release \
+              -DCMAKE_OSX_DEPLOYMENT_TARGET="$DEPLOYMENT_TARGET" \
+              -DCMAKE_OSX_ARCHITECTURES=arm64 \
+              -DCMAKE_INSTALL_PREFIX="$WORK/deps" \
+              -DCMAKE_PREFIX_PATH="$WORK/deps" \
+              "$@"
+            ninja -C "$src/build" -j"$(sysctl -n hw.ncpu)" install
+          }
+
+          git clone --depth 1 --branch "$LIBPNG_VERSION" \
+            https://github.com/pnggroup/libpng.git "$WORK/libpng"
+          cmake_dep "$WORK/libpng" \
+            -DPNG_SHARED=OFF -DPNG_STATIC=ON -DPNG_TESTS=OFF -DPNG_TOOLS=OFF
+
+          git clone --depth 1 --branch "$JPEGTURBO_VERSION" \
+            https://github.com/libjpeg-turbo/libjpeg-turbo.git "$WORK/libjpeg-turbo"
+          cmake_dep "$WORK/libjpeg-turbo" \
+            -DENABLE_SHARED=OFF -DENABLE_STATIC=ON \
+            -DWITH_TURBOJPEG=OFF -DWITH_TOOLS=OFF -DWITH_TESTS=OFF -DWITH_JAVA=OFF
+
+      - name: Build cjxl
+        run: |
+          set -eu
+          WORK="$RUNNER_TEMP/jxl-build"
+          cmake -B "$WORK/libjxl-build" -S "$GITHUB_WORKSPACE" -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_OSX_DEPLOYMENT_TARGET="$DEPLOYMENT_TARGET" \
+            -DCMAKE_OSX_ARCHITECTURES=arm64 \
+            -DJPEGXL_STATIC=ON \
+            -DBUILD_TESTING=OFF \
+            -DJPEGXL_ENABLE_TOOLS=ON \
+            -DJPEGXL_ENABLE_DOXYGEN=OFF \
+            -DJPEGXL_ENABLE_MANPAGES=OFF \
+            -DJPEGXL_ENABLE_BENCHMARK=OFF \
+            -DJPEGXL_ENABLE_EXAMPLES=OFF \
+            -DJPEGXL_ENABLE_JNI=OFF \
+            -DJPEGXL_ENABLE_SJPEG=OFF \
+            -DJPEGXL_ENABLE_OPENEXR=OFF \
+            -DJPEGXL_ENABLE_VIEWERS=OFF \
+            -DJPEGXL_ENABLE_PLUGINS=OFF \
+            -DJPEGXL_ENABLE_DEVTOOLS=OFF \
+            -DJPEGXL_ENABLE_FUZZERS=OFF \
+            -DJPEGXL_ENABLE_SKCMS=OFF \
+            -DCMAKE_DISABLE_FIND_PACKAGE_GIF=ON \
+            -DPNG_LIBRARY_RELEASE="$WORK/deps/lib/libpng16.a" \
+            -DPNG_PNG_INCLUDE_DIR="$WORK/deps/include" \
+            -DJPEG_LIBRARY_RELEASE="$WORK/deps/lib/libjpeg.a" \
+            -DJPEG_INCLUDE_DIR="$WORK/deps/include"
+
+          ninja -C "$WORK/libjxl-build" -j"$(sysctl -n hw.ncpu)" cjxl
+
+      # Anything pointing outside /usr/lib means a dylib slipped through and the
+      # app would need the install-name rewriting this pipeline exists to avoid.
+      - name: Verify
+        run: |
+          set -eu
+          WORK="$RUNNER_TEMP/jxl-build"
+          BIN="$WORK/libjxl-build/tools/cjxl"
+          test -x "$BIN"
+
+          STRAY="$(otool -L "$BIN" | tail -n +2 | awk '{print $1}' | grep -v '^/usr/lib/' || true)"
+          if [ -n "$STRAY" ]; then
+            echo "::error::cjxl links against non-system libraries"
+            echo "$STRAY"
+            exit 1
+          fi
+
+          ARCHS="$(lipo -archs "$BIN")"
+          [ "$ARCHS" = "arm64" ] || { echo "::error::built for $ARCHS, expected arm64"; exit 1; }
+
+          MINOS="$(vtool -show-build "$BIN" | awk '/minos/ {print $2; exit}')"
+          [ "$MINOS" = "$DEPLOYMENT_TARGET" ] || {
+            echo "::error::built for macOS $MINOS, expected $DEPLOYMENT_TARGET"
+            exit 1
+          }
+
+          echo "arch: $ARCHS"
+          vtool -show-build "$BIN" | grep -E "platform|minos|sdk"
+          otool -L "$BIN"
+          "$BIN" --version
+
+          mkdir -p dist
+          cp "$BIN" dist/cjxl
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: cjxl-arm64
+          path: dist/cjxl
+          if-no-files-found: error
+          retention-days: 90
+
+      - name: Publish to release
+        if: ${{ inputs.publish_release }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -eu
+          TAG="${{ inputs.release_tag }}"
+          if [ -z "$TAG" ]; then
+            echo "::error::release_tag is required when publish_release is true"
+            exit 1
+          fi
+          if ! gh release view "$TAG" >/dev/null 2>&1; then
+            echo "::error::release $TAG does not exist"
+            exit 1
+          fi
+          gh release upload "$TAG" dist/cjxl --clobber
