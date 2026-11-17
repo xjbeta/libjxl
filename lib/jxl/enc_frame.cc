@@ -4,6 +4,7 @@
 // license that can be found in the LICENSE file.
 
 #include "lib/jxl/enc_frame.h"
+#include "lib/jxl/fork_progress.h"
 
 #include <jxl/cms_interface.h>
 #include <jxl/encode.h>
@@ -1491,6 +1492,7 @@ Status EncodeGroups(const FrameHeader& frame_header,
                   group_index, ac_group_id, i,
                   ac_group_code(i, group_index)->BitsWritten());
     }
+    fork_progress::GroupDone();
     return true;
   };
   JXL_RETURN_IF_ERROR(RunOnPool(pool, 0, num_groups, resize_aux_outs,
@@ -2660,6 +2662,8 @@ Status EncodeFrame(JxlMemoryManager* memory_manager,
   }
 
   JXL_RETURN_IF_ERROR(ParamsPostInit(&cparams));
+  fork_progress::Reset(NumGroupsForFrame(frame_data.xsize, frame_data.ysize,
+                                        cparams));
 
   if (cparams.butteraugli_distance < 0) {
     return JXL_FAILURE("Expected non-negative distance");
@@ -2712,19 +2716,23 @@ Status EncodeFrame(JxlMemoryManager* memory_manager,
     return JXL_FAILURE("Can't add JPEG frame to XYB codestream");
   }
 
+  Status status = true;
   if (CanDoStreamingEncoding(cparams, frame_info, *metadata, frame_data)) {
-    return EncodeFrameStreaming(memory_manager, cparams, frame_info, metadata,
-                                frame_data, cms, pool, output_processor,
-                                aux_out, jxlp_counter);
+    status = EncodeFrameStreaming(memory_manager, cparams, frame_info, metadata,
+                                  frame_data, cms, pool, output_processor,
+                                  aux_out, jxlp_counter);
   } else {
     if (cparams.output_mode == 2 && jxlp_counter != nullptr) {
       // Leave a 12-byte gap for the jxlp box header; encode.cc fills it in.
       JXL_RETURN_IF_ERROR(
           output_processor->Seek(output_processor->CurrentPosition() + 12));
     }
-    return EncodeFrameOneShot(memory_manager, cparams, frame_info, metadata,
-                              frame_data, cms, pool, output_processor, aux_out);
+    status = EncodeFrameOneShot(memory_manager, cparams, frame_info, metadata,
+                                frame_data, cms, pool, output_processor,
+                                aux_out);
   }
+  if (status) fork_progress::Finish();
+  return status;
 }
 
 Status EncodeFrame(JxlMemoryManager* memory_manager,
